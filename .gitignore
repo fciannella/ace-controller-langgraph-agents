@@ -1,0 +1,79 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Logs
+*.log
+app.log
+
+# Unit test / coverage
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache/
+nosetests.xml
+coverage.xml
+htmlcov/
+.pytest_cache/
+
+# Type checkers
+.mypy_cache/
+.pytype/
+.pyre/
+
+# Environments
+.env
+.env.*
+agents/.env
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# IDEs / Editors
+.idea/
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local data / state
+saved_thread_id.txt
+
+# LangGraph local/dev artifacts
+.langgraph/
+.langgraph_api/
+.langgrap_api/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+
