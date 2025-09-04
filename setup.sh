@@ -10,7 +10,7 @@ NC='\033[0m' # No Color
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo -e "${BLUE}🔧 Setting up buchwurm-agents environment...${NC}"
+echo -e "${BLUE}🔧 Setting up environment...${NC}"
 
 # Check if Python 3 is installed
 if ! command -v python3 &> /dev/null; then
