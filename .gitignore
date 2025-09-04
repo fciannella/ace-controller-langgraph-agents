@@ -50,6 +50,10 @@ htmlcov/
 .env
 .env.*
 agents/.env
+.env.example
+agents/.env.example
+!.env.example
+!agents/.env.example
 .venv/
 venv/
 ENV/
