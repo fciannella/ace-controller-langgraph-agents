@@ -10,3 +10,4 @@ pytz
 docling
 pymongo
 yt_dlp
+requests

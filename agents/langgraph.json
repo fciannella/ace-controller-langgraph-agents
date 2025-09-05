@@ -1,12 +1,15 @@
 {
     "dependencies": ["."],
     "graphs": {
-      "ace-base-agent": "./ace_base_agent/ace_base_agent.py:agent"
+      "ace-base-agent": "./ace_base_agent/ace_base_agent.py:agent",
+      "ace-irbot-agent": "./ace_dmo_irbot/irbot_agent.py:agent"
     },
     "dockerfile_lines": [
             "RUN pip install --upgrade pip",
             "COPY ace_base_agent/requirements.txt /tmp/requirements.txt",
-            "RUN pip install -r /tmp/requirements.txt"
+            "RUN pip install -r /tmp/requirements.txt",
+            "COPY ../requirements.txt /tmp/root_requirements.txt",
+            "RUN pip install -r /tmp/root_requirements.txt"
         ],
     "env": ".env"
 }
