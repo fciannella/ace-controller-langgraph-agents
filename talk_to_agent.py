@@ -16,16 +16,20 @@ Environment variables (optional):
 import argparse
 import asyncio
 import os
+import json
 import sys
 from typing import Optional, Union, Any, Dict
+from dotenv import load_dotenv
 
 from langgraph_sdk import get_client
 from langchain_core.messages import HumanMessage
 
+load_dotenv(override=True)
 
 DEFAULT_BASE_URL = os.getenv("LANGGRAPH_BASE_URL", "http://127.0.0.1:2024")
 DEFAULT_ASSISTANT = os.getenv("LANGGRAPH_ASSISTANT", "ace-base-agent")
 DEFAULT_THREAD_FILE = os.path.join(os.path.dirname(__file__), "saved_thread_id.txt")
+
 
 
 def load_thread_id(thread_file_path: str) -> Optional[str]:
@@ -116,22 +120,32 @@ async def send_message(
     _attempt: int = 0,
     stream_mode: str = "values",
     debug_stream: bool = False,
-) -> tuple[str, Optional[str]]:
+) -> tuple[str, Optional[str], Optional[Dict[str, Any]]]:
     """Send one message and stream updates.
 
     Returns (final_text, effective_thread_id_if_changed)
     where effective_thread_id_if_changed is not None only if we created a new thread to recover from 404.
     """
     config: Dict[str, Any] = {"configurable": {"user_email": user_email}}
+    # Surface thread_id to agent via configurable for agents that use it as session_id
+    if thread_id:
+        config["configurable"]["thread_id"] = thread_id
+        config["configurable"]["session_id"] = thread_id
     last_text = ""
     assembled_text: list[str] = []
     updated_thread_id: Optional[str] = None
+    last_metadata: Optional[Dict[str, Any]] = None
 
     try:
+        # Include session_id in message additional_kwargs as a fallback path for agents
+        msg = HumanMessage(
+            content=message_text,
+            additional_kwargs={"session_id": thread_id} if thread_id else {},
+        )
         async for chunk in client.runs.stream(
             thread_id,
             assistant,
-            input=[HumanMessage(content=message_text)],
+            input=[msg],
             stream_mode=stream_mode,
             config=config,
         ):
@@ -166,8 +180,15 @@ async def send_message(
                 candidate_text = extract_message_content(data)
                 if candidate_text:
                     last_text = candidate_text
-                    sys.stdout.write("\n" + candidate_text)
-                    sys.stdout.flush()
+                # Avoid printing here to prevent duplicate output; we'll print once at the end
+                # Capture response metadata if present (dict or object)
+                try:
+                    if isinstance(data, dict) and isinstance(data.get("response_metadata"), dict):
+                        last_metadata = data.get("response_metadata")
+                    elif hasattr(data, "response_metadata") and isinstance(getattr(data, "response_metadata"), dict):
+                        last_metadata = getattr(data, "response_metadata")
+                except Exception:
+                    pass
             if "on_chat_model_stream" in evt:
                 # Try multiple shapes
                 part_text = ""
@@ -207,6 +228,14 @@ async def send_message(
                         if not assembled_text or last_text != "".join(assembled_text):
                             sys.stdout.write("\n" + last_text)
                             sys.stdout.flush()
+                    # Try to capture response metadata from the last message
+                    try:
+                        if isinstance(last, dict) and isinstance(last.get("response_metadata"), dict):
+                            last_metadata = last.get("response_metadata")
+                        elif hasattr(last, "response_metadata") and isinstance(getattr(last, "response_metadata"), dict):
+                            last_metadata = getattr(last, "response_metadata")
+                    except Exception:
+                        pass
             else:
                 # If the data itself looks like a message with content, print it
                 if hasattr(data, "content"):
@@ -243,7 +272,7 @@ async def send_message(
         if not last_text and assembled_text:
             last_text = "".join(assembled_text)
             print()  # ensure newline after token stream
-        return last_text, updated_thread_id
+        return last_text, updated_thread_id, last_metadata
     except Exception as exc:
         # Auto-recover from missing/expired thread (common after local dev restart)
         text_exc = str(exc)
@@ -258,7 +287,7 @@ async def send_message(
                     print("Previous thread not found; created a new thread and retrying...")
                     # Track updated thread id so caller can reuse it next time
                     updated_thread_id = new_thread_id
-                    text, _ = await send_message(
+                    text, _, md = await send_message(
                         client,
                         assistant,
                         message_text,
@@ -268,11 +297,11 @@ async def send_message(
                         _attempt=1,
                         stream_mode=stream_mode,
                     )
-                    return text, updated_thread_id
+                    return text, updated_thread_id, md
                 else:
                     # Second failure using threads → fall back to threadless
                     print("Threads unavailable in this dev session; switching to threadless runs.")
-                    text, _ = await send_message(
+                    text, _, md = await send_message(
                         client,
                         assistant,
                         message_text,
@@ -282,11 +311,11 @@ async def send_message(
                         _attempt=2,
                         stream_mode=stream_mode,
                     )
-                    return text, None
+                    return text, None, md
             except Exception as inner_exc:
                 print(f"Error creating new thread after 404: {inner_exc}")
         print(f"Error during streaming: {exc}")
-        return "", None
+        return "", None, None
 
 
 async def interactive_chat(
@@ -323,7 +352,7 @@ async def interactive_chat(
             continue
 
         # Use 'values' mode first; dev server reliably returns final value
-        response_text, new_thread = await send_message(
+        response_text, new_thread, metadata = await send_message(
             client,
             assistant,
             user_input,
@@ -338,6 +367,13 @@ async def interactive_chat(
             print(f"(Thread switched) Thread: {thread_id}")
         if response_text:
             print(f"Agent: {response_text}")
+            # Print IRBot metadata if present
+            try:
+                if isinstance(metadata, dict) and isinstance(metadata.get("irbot"), (dict, list)):
+                    print("Metadata (irbot):")
+                    print(json.dumps(metadata.get("irbot"), indent=2))
+            except Exception:
+                pass
         else:
             print("Agent: <no response>")
 
