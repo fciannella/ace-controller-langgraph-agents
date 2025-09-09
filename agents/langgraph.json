@@ -2,7 +2,8 @@
     "dependencies": ["."],
     "graphs": {
       "ace-base-agent": "./ace_base_agent/ace_base_agent.py:agent",
-      "ace-irbot-agent": "./ace_dmo_irbot/irbot_agent.py:agent"
+      "ace-irbot-agent": "./ace_dmo_irbot/irbot_agent.py:agent",
+      "rbc-fees-agent": "./rbc-fees-agent/react_agent.py:agent"
     },
     "dockerfile_lines": [
             "RUN pip install --upgrade pip",

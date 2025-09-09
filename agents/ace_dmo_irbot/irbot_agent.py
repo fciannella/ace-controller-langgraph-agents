@@ -1,5 +1,6 @@
 import os
 import logging
+import inspect
 import asyncio
 from typing import Any, Dict, List, Optional
 
@@ -8,12 +9,13 @@ from pprint import pformat
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langchain_openai import ChatOpenAI
 try:
-    from .explain_prompt import EXPLAIN_WITH_CONTEXT_PROMPT
+    from .explain_prompt import EXPLAIN_WITH_CONTEXT_PROMPT, TTS_SUMMARY_PROMPT, BACKCHANNEL_PROMPT
 except ImportError:
     import sys
     sys.path.append(os.path.dirname(__file__))
-    from explain_prompt import EXPLAIN_WITH_CONTEXT_PROMPT
+    from explain_prompt import EXPLAIN_WITH_CONTEXT_PROMPT, TTS_SUMMARY_PROMPT, BACKCHANNEL_PROMPT
 from langgraph.func import entrypoint, task
+from langgraph.types import StreamWriter
 
 
 IRBOT_BASE_URL = os.getenv("IRBOT_BASE_URL", "https://api-prod.nvidia.com")
@@ -46,12 +48,82 @@ def irbot_userquery_task(query: str, session_id: str) -> Dict[str, Any]:
 
 def _extract_text_from_response(data: Dict[str, Any]) -> str:
     # Try common fields where backend may place the textual response
-    for key in ("answer", "message", "text", "content", "response"):
+    for key in ("answer", "message", "text", "content", "response", "data"):
         val = data.get(key)
         if isinstance(val, str) and val.strip():
             return val
     # Fallback to stringify
     return str(data)
+
+
+async def _writer_send(writer: Any, payload: Any) -> bool:
+    """Best-effort send supporting writer.write(...), async callables, and sync callables."""
+    # Case 1: writer object with .write
+    try:
+        if hasattr(writer, "write"):
+            method = getattr(writer, "write")
+            try:
+                result = method(payload)
+                if inspect.isawaitable(result):
+                    await result
+                return True
+            except Exception as e:
+                logger.warning(f"Backchannel: writer.write failed: {e}")
+    except Exception:
+        pass
+    # Case 2: writer is callable (async or sync)
+    try:
+        if callable(writer):
+            result = writer(payload)
+            if inspect.isawaitable(result):
+                await result
+            return True
+    except Exception as e:
+        logger.warning(f"Backchannel: callable writer failed: {e}")
+    return False
+
+
+async def _periodic_backchannel(
+    writer: StreamWriter,
+    stop_event: asyncio.Event,
+    initial_message: str = "Give me a moment, I'm checking that now...",
+    followups: Optional[List[str]] = None,
+    interval_seconds: float = 8.0,
+) -> None:
+    """Emit an initial backchannel update and a few periodic follow-ups until stop_event is set.
+
+    This is a best-effort helper. If the runtime hasn't injected a writer, the caller should avoid
+    spawning this task. All write failures are logged and ignored so they don't break the run.
+    """
+    # Send initial message immediately
+    try:
+        logger.info(f"Backchannel (initial): {initial_message}")
+        sent = await _writer_send(writer, {"messages": [AIMessage(content=initial_message)]})
+        if not sent:
+            await _writer_send(writer, AIMessage(content=initial_message))
+    except Exception:
+        pass
+
+    # Periodic follow-ups
+    idx = 0
+    followups = followups or [
+        "Still working on it...",
+        "Thanks for your patience, almost there...",
+    ]
+    while not stop_event.is_set():
+        try:
+            await asyncio.sleep(interval_seconds)
+            if stop_event.is_set():
+                break
+            msg = followups[idx % len(followups)]
+            logger.info(f"Backchannel (follow-up): {msg}")
+            sent = await _writer_send(writer, {"messages": [AIMessage(content=msg)]})
+            if not sent:
+                await _writer_send(writer, AIMessage(content=msg))
+            idx += 1
+        except Exception:
+            # Do not crash the loop due to transient issues
+            break
 
 
 @task()
@@ -87,6 +159,59 @@ def explain_with_context_task(serialized_messages: list[dict]) -> str:
         pass
     content = getattr(result, "content", None)
     return content if isinstance(content, str) else ""
+
+
+@task()
+def backchannel_task(text: str) -> Dict[str, Any]:
+    """Emit a serializable assistant message so updates mode surfaces it.
+
+    Task outputs must be JSON-serializable. We return a minimal 'messages' list
+    with an assistant-like dict the client can recognize.
+    """
+    return {"messages": [{"type": "ai", "content": text}]}
+
+
+@task()
+def tts_summarize_task(original_text: str) -> str:
+    """Summarize arbitrary text into a short TTS-friendly paragraph."""
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
+        return original_text
+    llm = ChatOpenAI(model=os.getenv("TTS_SUMMARY_MODEL", "gpt-4o-mini"), api_key=openai_api_key)
+    chain = TTS_SUMMARY_PROMPT | llm
+    try:
+        res = chain.invoke({"original": original_text})
+        content = getattr(res, "content", None)
+        return content if isinstance(content, str) and content.strip() else original_text
+    except Exception:
+        return original_text
+
+
+@task()
+def generate_backchannel_task(question: str, history: list[str] | None = None, seed: int | None = None) -> str:
+    """Create a varied, context-aware backchannel line using a fast model."""
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
+        # Fallback to static
+        return "Working on it—this will take just a moment."
+    llm = ChatOpenAI(
+        model=os.getenv("BACKCHANNEL_MODEL", "gpt-4o-mini"),
+        api_key=openai_api_key,
+        temperature=float(os.getenv("BACKCHANNEL_TEMPERATURE", "0.9")),
+    )
+    try:
+        history_text = "\n".join(history or [])
+        # Some SDKs support seed via kwargs; ignore if unsupported
+        if seed is not None and hasattr(llm, "kwargs"):
+            llm.kwargs = {**getattr(llm, "kwargs", {}), "seed": seed}
+        chain = BACKCHANNEL_PROMPT | llm
+        res = chain.invoke({"question": question, "history": history_text})
+        content = getattr(res, "content", None)
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    except Exception:
+        pass
+    return "Still working—thanks for your patience."
 
 
 async def _maybe_generate_explanation(backend: Dict[str, Any], question: str, convo_messages: list[BaseMessage]) -> Optional[str]:
@@ -137,7 +262,12 @@ async def _maybe_generate_explanation(backend: Dict[str, Any], question: str, co
 
 
 @entrypoint()
-async def agent(messages: List[Any], previous: Optional[List[Any]], config: Optional[Dict[str, Any]] = None):
+async def agent(
+    messages: List[Any],
+    previous: Optional[List[Any]],
+    config: Optional[Dict[str, Any]] = None,
+    writer: StreamWriter = None,
+):
     # No accumulation: just proxy the latest human message to IRBot using thread_id as session_id
     if not messages:
         logger.info("IRBot proxy: no incoming messages")
@@ -217,8 +347,37 @@ async def agent(messages: List[Any], previous: Optional[List[Any]], config: Opti
         if not user_text.strip():
             logger.info("IRBot proxy: empty user content; returning empty response")
             return entrypoint.final(value=AIMessage(content=""), save=None)
-        # Execute backend call as a task (checkpointed & non-blocking for event loop)
-        backend = await irbot_userquery_task(query=user_text or "", session_id=session_id)
+        # Execute backend call as a task (checkpointed) and emit state-based backchannel updates
+        future = irbot_userquery_task(query=user_text or "", session_id=session_id)
+        logger.info(f"Backchannel: writer available (ignored): {writer is not None}")
+
+        # Also emit backchannel into graph state so updates mode surfaces it
+        try:
+            first_bc = await generate_backchannel_task(question=user_text or "", history=[])
+            _ = await backchannel_task(text=first_bc)
+            backchannel_history: list[str] = [first_bc]
+        except Exception as e:
+            logger.warning(f"Backchannel task emit failed: {e}")
+            backchannel_history = []
+
+        # Periodic follow-up backchannel into graph state while waiting
+        try:
+            while not future.done():
+                await asyncio.sleep(8)
+                try:
+                    new_bc = await generate_backchannel_task(
+                        question=user_text or "",
+                        history=backchannel_history,
+                    )
+                    if isinstance(new_bc, str) and new_bc.strip():
+                        backchannel_history.append(new_bc)
+                        _ = await backchannel_task(text=new_bc)
+                except Exception as e:
+                    logger.debug(f"Backchannel follow-up emit skipped: {e}")
+        except Exception:
+            pass
+
+        backend = await future
         text = _extract_text_from_response(backend)
         # Accumulate short-term memory locally (do not send to backend)
         convo_messages: list[BaseMessage] = []
@@ -250,8 +409,13 @@ async def agent(messages: List[Any], previous: Optional[List[Any]], config: Opti
             content_out = expl if expl else text
             ai = AIMessage(content=content_out, response_metadata={"irbot": backend})
         else:
-            # String or other response types: just return the text
-            ai = AIMessage(content=text)
+            # String or other response types: produce a TTS-friendly summary as content; return raw backend text in metadata
+            try:
+                tts_text = await tts_summarize_task(original_text=text)
+            except Exception:
+                tts_text = text
+            ai = AIMessage(content=tts_text, response_metadata={"irbot": backend, "raw_text": text})
+        # Note: We intentionally do not use writer here; updates mode will include final agent value
         # Accumulate final short-term memory for next turn
         final_messages = (previous or []) + [HumanMessage(content=user_text or ""), ai]
         return entrypoint.final(value=ai, save=final_messages)
